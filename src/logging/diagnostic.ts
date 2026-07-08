@@ -81,11 +81,17 @@ const MIN_STUCK_SESSION_WARN_MS = 1_000;
 const MAX_STUCK_SESSION_WARN_MS = 24 * 60 * 60 * 1000;
 const MIN_STALLED_EMBEDDED_RUN_ABORT_MS = 5 * 60_000;
 const STALLED_EMBEDDED_RUN_ABORT_WARN_MULTIPLIER = 3;
+// Quiet-but-alive tools are normal agent behavior; the CLI byte watchdog kills
+// truly silent children within its own deadline. This floor only bounds
+// diagnostic recovery aborts; lowering it reopens #88870, removing it reopens #96168.
+const BLOCKED_TOOL_CALL_ABORT_FLOOR_MS = 15 * 60_000;
 const RECENT_DIAGNOSTIC_ACTIVITY_MS = 120_000;
 const DEFAULT_LIVENESS_EVENT_LOOP_DELAY_WARN_MS = 1_000;
 const DEFAULT_LIVENESS_EVENT_LOOP_UTILIZATION_WARN = 0.95;
 const DEFAULT_LIVENESS_CPU_CORE_RATIO_WARN = 0.9;
 const DEFAULT_LIVENESS_WARN_COOLDOWN_MS = 120_000;
+const DIAGNOSTIC_HEARTBEAT_INTERVAL_MS = 30_000;
+const DIAGNOSTIC_HEARTBEAT_DELAY_RECOVERY_SKIP_MS = 3 * DIAGNOSTIC_HEARTBEAT_INTERVAL_MS;
 const loadStuckSessionRecoveryRuntime = createLazyRuntimeModule(
   () => import("./diagnostic-stuck-session-recovery.runtime.js"),
 );
@@ -497,14 +503,15 @@ function isBlockedToolCallRecoveryEligible(params: {
 }): boolean {
   const toolAgeMs = params.activity?.activeToolAgeMs;
   const lastProgressAgeMs = params.activity?.lastProgressAgeMs;
+  const abortMs = Math.max(params.stuckSessionAbortMs, BLOCKED_TOOL_CALL_ABORT_FLOOR_MS);
   return (
     params.classification?.eventType === "session.stalled" &&
     params.classification.classification === "blocked_tool_call" &&
     params.classification.activeWorkKind === "tool_call" &&
     typeof toolAgeMs === "number" &&
     typeof lastProgressAgeMs === "number" &&
-    toolAgeMs >= params.stuckSessionAbortMs &&
-    lastProgressAgeMs >= params.stuckSessionAbortMs
+    toolAgeMs >= abortMs &&
+    lastProgressAgeMs >= abortMs
   );
 }
 
@@ -1171,6 +1178,7 @@ export function logActiveRuns() {
 }
 
 let heartbeatInterval: NodeJS.Timeout | null = null;
+let lastDiagnosticHeartbeatTickAt: number | undefined;
 
 export function startDiagnosticHeartbeat(
   config?: OpenClawConfig,
@@ -1187,6 +1195,7 @@ export function startDiagnosticHeartbeat(
   startDiagnosticLivenessSampler();
   const livenessGraceUntil =
     opts?.startupGraceMs != null && opts.startupGraceMs > 0 ? Date.now() + opts.startupGraceMs : 0;
+  lastDiagnosticHeartbeatTickAt = Date.now();
   heartbeatInterval = setInterval(() => {
     let heartbeatConfig = config;
     if (!heartbeatConfig) {
@@ -1200,6 +1209,17 @@ export function startDiagnosticHeartbeat(
     const stuckSessionAbortMs = resolveStuckSessionAbortMs(heartbeatConfig, stuckSessionWarnMs);
     const compactionSafetyTimeoutMs = resolveCompactionTimeoutMs(heartbeatConfig);
     const now = Date.now();
+    const tickDelayMs =
+      lastDiagnosticHeartbeatTickAt === undefined ? 0 : now - lastDiagnosticHeartbeatTickAt;
+    lastDiagnosticHeartbeatTickAt = now;
+    // A late interval tick means the process was stalled, not the sessions.
+    // Acting on inflated ages here can abort healthy runs; the next on-time tick decides.
+    const skipRecoveryThisTick = tickDelayMs > DIAGNOSTIC_HEARTBEAT_DELAY_RECOVERY_SKIP_MS;
+    if (skipRecoveryThisTick) {
+      diag.warn(
+        `liveness heartbeat delayed ${Math.round(tickDelayMs)}ms; deferring recovery decisions`,
+      );
+    }
     pruneDiagnosticSessionStates(now, true);
     const work = getDiagnosticWorkSnapshot(now);
     const inStartupGrace = livenessGraceUntil > 0 && now < livenessGraceUntil;
@@ -1282,7 +1302,7 @@ export function startDiagnosticHeartbeat(
           thresholdMs: stuckSessionWarnMs,
           abortThresholdMs: stuckSessionAbortMs,
         });
-        if (classification?.recoveryEligible) {
+        if (classification?.recoveryEligible && !skipRecoveryThisTick) {
           requestStuckSessionRecovery({
             recover: opts?.recoverStuckSession ?? recoverStuckSession,
             classification,
@@ -1300,6 +1320,7 @@ export function startDiagnosticHeartbeat(
           });
         } else if (
           classification &&
+          !skipRecoveryThisTick &&
           isActiveAbortRecoveryEligible({
             classification,
             activity,
@@ -1324,7 +1345,7 @@ export function startDiagnosticHeartbeat(
         }
       }
     }
-  }, 30_000);
+  }, DIAGNOSTIC_HEARTBEAT_INTERVAL_MS);
   heartbeatInterval.unref?.();
 }
 
@@ -1333,6 +1354,7 @@ export function stopDiagnosticHeartbeat() {
     clearInterval(heartbeatInterval);
     heartbeatInterval = null;
   }
+  lastDiagnosticHeartbeatTickAt = undefined;
   stopDiagnosticLivenessSampler();
   stopDiagnosticStabilityRecorder();
   uninstallDiagnosticStabilityFatalHook();
